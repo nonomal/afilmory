@@ -1,12 +1,6 @@
+import { HoverCard, HoverCardContent, HoverCardTrigger, LazyImage } from '@afilmory/ui'
 import { m } from 'motion/react'
 import { Marker } from 'react-map-gl/maplibre'
-
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from '~/components/ui/hover-card'
-import { LazyImage } from '~/components/ui/lazy-image'
 
 import { ClusterPhotoGrid } from '../ClusterPhotoGrid'
 import type { ClusterMarkerProps } from './types'
@@ -71,16 +65,9 @@ export const ClusterMarker = ({
                     const position = positions[index]
 
                     return (
-                      <div
-                        key={photoMarker.photo.id}
-                        className="absolute opacity-30"
-                        style={position}
-                      >
+                      <div key={photoMarker.photo.id} className="absolute opacity-30" style={position}>
                         <LazyImage
-                          src={
-                            photoMarker.photo.thumbnailUrl ||
-                            photoMarker.photo.originalUrl
-                          }
+                          src={photoMarker.photo.thumbnailUrl || photoMarker.photo.originalUrl}
                           alt={photoMarker.photo.title || photoMarker.photo.id}
                           thumbHash={photoMarker.photo.thumbHash}
                           className="h-full w-full object-cover"
@@ -92,12 +79,12 @@ export const ClusterMarker = ({
                   })}
 
                   {/* Overlay for mosaic effect */}
-                  <div className="from-blue/40 to-indigo/60 absolute inset-0 bg-gradient-to-br" />
+                  <div className="from-blue/40 to-indigo/60 absolute inset-0 bg-linear-to-br" />
                 </div>
               )}
 
               {/* Glass morphism overlay */}
-              <div className="absolute inset-0 rounded-full bg-gradient-to-br from-white/30 to-white/10 dark:from-white/20 dark:to-white/5" />
+              <div className="absolute inset-0 rounded-full bg-linear-to-br from-white/30 to-white/10 dark:from-white/20 dark:to-white/5" />
 
               {/* Count display */}
               <div className="relative z-10 flex flex-col items-center text-xs">

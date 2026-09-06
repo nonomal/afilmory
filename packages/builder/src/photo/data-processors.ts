@@ -1,22 +1,16 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
+import type { PhotoManifestItem, PickedExif, ToneAnalysis } from '@afilmory/typing'
+import { decompressUint8Array } from '@afilmory/utils'
 import type sharp from 'sharp'
 
 import { HEIC_FORMATS } from '../constants/index.js'
 import { extractExifData } from '../image/exif.js'
 import { calculateHistogramAndAnalyzeTone } from '../image/histogram.js'
-import {
-  generateThumbnailAndBlurhash,
-  thumbnailExists,
-} from '../image/thumbnail.js'
-import { decompressUint8Array } from '../lib/u8array.js'
+import { generateThumbnailAndBlurhash, thumbnailExists } from '../image/thumbnail.js'
 import { workdir } from '../path.js'
-import type {
-  PhotoManifestItem,
-  PickedExif,
-  ToneAnalysis,
-} from '../types/photo.js'
+import { getPhotoExecutionContext } from './execution-context.js'
 import { getGlobalLoggers } from './logger-adapter.js'
 import type { PhotoProcessorOptions } from './processor.js'
 
@@ -37,6 +31,8 @@ export async function processThumbnailAndBlurhash(
   options: PhotoProcessorOptions,
 ): Promise<ThumbnailResult> {
   const loggers = getGlobalLoggers()
+  const { builder } = getPhotoExecutionContext()
+  const { limitInputPixels } = builder.getConfig().system.processing
 
   // 检查是否可以复用现有数据
   if (
@@ -46,13 +42,9 @@ export async function processThumbnailAndBlurhash(
     (await thumbnailExists(photoId))
   ) {
     try {
-      const thumbnailPath = path.join(
-        workdir,
-        'public/thumbnails',
-        `${photoId}.webp`,
-      )
+      const thumbnailPath = path.join(workdir, 'public/thumbnails', `${photoId}.jpg`)
       const thumbnailBuffer = await fs.readFile(thumbnailPath)
-      const thumbnailUrl = `/thumbnails/${photoId}.webp`
+      const thumbnailUrl = `/thumbnails/${photoId}.jpg`
 
       loggers.blurhash.info(`复用现有 blurhash: ${photoId}`)
       loggers.thumbnail.info(`复用现有缩略图：${photoId}`)
@@ -73,6 +65,8 @@ export async function processThumbnailAndBlurhash(
     imageBuffer,
     photoId,
     options.isForceMode || options.isForceThumbnails,
+    !options.dryRun,
+    limitInputPixels,
   )
 
   return {
@@ -122,11 +116,7 @@ export async function processToneAnalysis(
   const loggers = getGlobalLoggers()
 
   // 检查是否可以复用现有数据
-  if (
-    !options.isForceMode &&
-    !options.isForceManifest &&
-    existingItem?.toneAnalysis
-  ) {
+  if (!options.isForceMode && !options.isForceManifest && existingItem?.toneAnalysis) {
     const photoId = path.basename(photoKey, path.extname(photoKey))
     loggers.tone.info(`复用现有影调分析：${photoId}`)
     return existingItem.toneAnalysis

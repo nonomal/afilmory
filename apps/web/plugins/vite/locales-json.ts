@@ -1,4 +1,3 @@
-
 import { set } from 'es-toolkit/compat'
 import type { Plugin } from 'vite'
 
@@ -10,6 +9,9 @@ export function localesJsonPlugin(): Plugin {
     enforce: 'pre',
 
     async transform(code, id) {
+      if (!id.includes('locales')) {
+        return null
+      }
       if (!id.includes(MONOREPO_ROOT_PATH) || !id.endsWith('.json')) {
         return null
       }

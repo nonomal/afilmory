@@ -2,8 +2,10 @@
 import 'maplibre-gl/dist/maplibre-gl.css'
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { MapRef } from 'react-map-gl/maplibre'
 import Map from 'react-map-gl/maplibre'
 
+import { siteConfig } from '~/config'
 import { getMapStyle } from '~/lib/map/style'
 import { calculateMapBounds } from '~/lib/map-utils'
 import type { PhotoMarker } from '~/types/map'
@@ -30,12 +32,12 @@ export interface PureMaplibreProps {
   selectedMarkerId?: string | null
   geoJsonData?: GeoJSON.FeatureCollection
   onMarkerClick?: (marker: PhotoMarker) => void
-  onGeoJsonClick?: (event: any) => void
+  onGeoJsonClick?: React.ComponentProps<typeof Map>['onClick']
   onGeolocate?: (longitude: number, latitude: number) => void
   onClusterClick?: (longitude: number, latitude: number) => void
   className?: string
   style?: React.CSSProperties
-  mapRef?: React.RefObject<any>
+  mapRef?: React.RefObject<MapRef | null>
   autoFitBounds?: boolean
 }
 
@@ -58,6 +60,12 @@ export const Maplibre = ({
   const [viewState, setViewState] = useState(initialViewState)
   const [isMapLoaded, setIsMapLoaded] = useState(false)
   const [hasInitialFitCompleted, setHasInitialFitCompleted] = useState(false)
+  const projection = useMemo(
+    () => ({
+      type: siteConfig.mapProjection ?? 'mercator',
+    }),
+    [],
+  )
 
   // Handle marker click - only call the external callback
   const handleMarkerClick = useCallback(
@@ -71,9 +79,7 @@ export const Maplibre = ({
   const handleMarkerClose = useCallback(() => {
     if (selectedMarkerId && onMarkerClick) {
       // Find the currently selected marker and call onMarkerClick to deselect it
-      const selectedMarker = markers.find(
-        (marker) => marker.id === selectedMarkerId,
-      )
+      const selectedMarker = markers.find(marker => marker.id === selectedMarkerId)
       if (selectedMarker) {
         onMarkerClick(selectedMarker)
       }
@@ -82,34 +88,42 @@ export const Maplibre = ({
 
   // Clustered markers
   const clusteredMarkers = useMemo(
-    () => clusterMarkers(markers, currentZoom),
-    [markers, currentZoom],
+    () => clusterMarkers(markers, currentZoom, { selectedMarkerId }),
+    [markers, currentZoom, selectedMarkerId],
   )
 
   // 计算合适的缩放级别
   const calculateZoomLevel = useCallback((latDiff: number, lngDiff: number) => {
     const maxDiff = Math.max(latDiff, lngDiff)
 
-    if (maxDiff < 0.001) return 16 // 非常接近的点
-    if (maxDiff < 0.01) return 14 // 很接近的点
-    if (maxDiff < 0.1) return 11 // 附近的点
-    if (maxDiff < 1) return 8 // 同一城市
-    if (maxDiff < 10) return 5 // 同一国家/地区
+    if (maxDiff < 0.001) {
+      return 16
+    }
+    if (maxDiff < 0.01) {
+      return 14
+    }
+    if (maxDiff < 0.1) {
+      return 11
+    }
+    if (maxDiff < 1) {
+      return 8
+    }
+    if (maxDiff < 10) {
+      return 5
+    }
     return 2 // 跨洲
   }, [])
 
   // 自动适配到包含所有照片的区域 - 只在初次加载时执行
   const fitMapToBounds = useCallback(() => {
-    if (
-      !autoFitBounds ||
-      markers.length === 0 ||
-      !isMapLoaded ||
-      hasInitialFitCompleted
-    )
+    if (!autoFitBounds || markers.length === 0 || !isMapLoaded || hasInitialFitCompleted) {
       return
+    }
 
     const bounds = calculateMapBounds(markers)
-    if (!bounds) return
+    if (!bounds) {
+      return
+    }
 
     // 标记初次适配已完成
     setHasInitialFitCompleted(true)
@@ -158,20 +172,22 @@ export const Maplibre = ({
             maxZoom: 15, // 最大缩放级别限制，避免过度放大
           },
         )
-      } catch (error) {
+      }
+      catch (error) {
         console.warn('使用 fitBounds 失败，使用备用方案:', error)
         // 备用方案：手动计算视图状态
         fallbackToViewState(bounds)
       }
-    } else {
+    }
+    else {
       // mapRef 不可用时的备用方案
       fallbackToViewState(bounds)
     }
 
-    function fallbackToViewState(
-      bounds: ReturnType<typeof calculateMapBounds>,
-    ) {
-      if (!bounds) return
+    function fallbackToViewState(bounds: ReturnType<typeof calculateMapBounds>) {
+      if (!bounds) {
+        return
+      }
 
       const latDiff = bounds.maxLat - bounds.minLat
       const lngDiff = bounds.maxLng - bounds.minLng
@@ -187,14 +203,7 @@ export const Maplibre = ({
       setViewState(newViewState)
       setCurrentZoom(zoom)
     }
-  }, [
-    markers,
-    autoFitBounds,
-    isMapLoaded,
-    mapRef,
-    calculateZoomLevel,
-    hasInitialFitCompleted,
-  ])
+  }, [markers, autoFitBounds, isMapLoaded, mapRef, calculateZoomLevel, hasInitialFitCompleted])
 
   // 当地图加载完成时触发适配
   const handleMapLoad = useCallback(() => {
@@ -219,6 +228,7 @@ export const Maplibre = ({
         {...viewState}
         style={{ width: '100%', height: '100%' }}
         mapStyle={getMapStyle()}
+        projection={projection}
         attributionControl={false}
         interactiveLayerIds={geoJsonData ? ['data'] : undefined}
         onClick={onGeoJsonClick}
@@ -246,10 +256,13 @@ export const Maplibre = ({
                 onClusterClick={onClusterClick}
               />
             )
-          } else {
+          }
+          else {
             // Render individual marker
             const { marker } = clusterPoint.properties
-            if (!marker) return null
+            if (!marker) {
+              return null
+            }
 
             return (
               <PhotoMarkerPin

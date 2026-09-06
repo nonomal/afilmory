@@ -1,54 +1,61 @@
+import type { Buffer } from 'node:buffer'
 import { mkdir, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import process from 'node:process'
 
+import type {
+  ExiftoolXmpArea,
+  ExiftoolXmpDimensions,
+  ExiftoolXmpRegionInfo,
+  PhotoRegion,
+  PhotoXmpMetadata,
+  PickedExif,
+} from '@afilmory/typing'
 import { isNil, noop } from 'es-toolkit'
 import type { ExifDateTime, Tags } from 'exiftool-vendored'
-import { exiftool } from 'exiftool-vendored'
-import type { Metadata } from 'sharp'
-import sharp from 'sharp'
+import { ExifTool } from 'exiftool-vendored'
 
 import { getGlobalLoggers } from '../photo/logger-adapter.js'
-import type { PickedExif } from '../types/photo.js'
+
+const exiftool = new ExifTool({
+  ...(process.env.EXIFTOOL_PATH ? { exiftoolPath: process.env.EXIFTOOL_PATH } : {}),
+  taskTimeoutMillis: 30000,
+})
+
+const EMPTY_XMP_METADATA: PhotoXmpMetadata = {
+  keywords: [],
+  regions: [],
+}
+
+let isExiftoolClosed = false
+const closeExiftool = () => {
+  if (isExiftoolClosed) {
+    return
+  }
+  isExiftoolClosed = true
+  exiftool.end().catch(noop)
+}
+
+if (process.env.NODE_ENV !== 'development') {
+  process.once('beforeExit', closeExiftool)
+  process.once('SIGINT', closeExiftool)
+  process.once('SIGTERM', closeExiftool)
+}
 
 // 提取 EXIF 数据
-export async function extractExifData(
-  imageBuffer: Buffer,
-  originalBuffer?: Buffer,
-): Promise<PickedExif | null> {
+export async function extractExifData(imageBuffer: Buffer, originalBuffer?: Buffer): Promise<PickedExif | null> {
   const log = getGlobalLoggers().exif
 
+  await mkdir('/tmp/image_process', { recursive: true })
+  const tempImagePath = path.resolve('/tmp/image_process', `${crypto.randomUUID()}.jpg`)
+
   try {
-    log.info('开始提取 EXIF 数据')
-
-    // 首先尝试从处理后的图片中提取 EXIF
-    let metadata = await sharp(imageBuffer).metadata()
-
-    // 如果处理后的图片没有 EXIF 数据，且提供了原始 buffer，尝试从原始图片提取
-    if (!metadata.exif && originalBuffer) {
-      log.info('处理后的图片缺少 EXIF 数据，尝试从原始图片提取')
-      try {
-        metadata = await sharp(originalBuffer).metadata()
-      } catch (error) {
-        log.warn('从原始图片提取 EXIF 失败，可能是不支持的格式：', error)
-      }
-    }
-
-    if (!metadata.exif) {
-      log.warn('未找到 EXIF 数据')
-      return null
-    }
-
-    await mkdir('/tmp/image_process', { recursive: true })
-    const tempImagePath = path.resolve(
-      '/tmp/image_process',
-      `${crypto.randomUUID()}.jpg`,
-    )
-
     await writeFile(tempImagePath, originalBuffer || imageBuffer)
-    const exifData = await exiftool.read(tempImagePath)
-    const result = handleExifData(exifData, metadata)
 
-    await unlink(tempImagePath).catch(noop)
+    log.info(`开始提取 EXIF 数据, 文件路径: ${tempImagePath}`)
+    const exifData = await exiftool.read(tempImagePath)
+
+    const result = handleExifData(exifData)
 
     if (!exifData) {
       log.warn('EXIF 数据解析失败')
@@ -62,9 +69,13 @@ export async function extractExifData(
 
     log.success('EXIF 数据提取完成')
     return result
-  } catch (error) {
+  }
+  catch (error) {
     log.error('提取 EXIF 数据失败:', error)
     return null
+  }
+  finally {
+    await unlink(tempImagePath).catch(noop)
   }
 }
 
@@ -109,7 +120,7 @@ const pickKeys: Array<keyof Tags | (string & {})> = [
   'WBShiftAB',
   'WBShiftGM',
   'WhiteBalanceBias',
-  'WhiteBalanceFineTune',
+
   'FlashMeteringMode',
   'SensingMethod',
   'FocalPlaneXResolution',
@@ -130,8 +141,41 @@ const pickKeys: Array<keyof Tags | (string & {})> = [
   'GPSLongitudeRef',
   // HDR相关字段
   'MPImageType',
+  'UniformResourceName',
+  // Motion Photo 相关字段
+  'MotionPhoto',
+  'MotionPhotoVersion',
+  'MotionPhotoPresentationTimestampUs',
+  'ContainerDirectory',
+  'MicroVideo',
+  'MicroVideoVersion',
+  'MicroVideoOffset',
+  'MicroVideoPresentationTimestampUs',
+  // XMP keyword / region fields
+  'Subject',
+  'Keywords',
+  'WeightedFlatSubject',
+  'HierarchicalSubject',
+  'RegionInfo',
 ]
-function handleExifData(exifData: Tags, metadata: Metadata): PickedExif {
+
+export function extractXmpMetadataFromExif(exifData: PickedExif | null | undefined): PhotoXmpMetadata {
+  if (!exifData) {
+    return EMPTY_XMP_METADATA
+  }
+
+  return {
+    keywords: mergeUniqueStrings(
+      normalizeStringArray(exifData.Subject),
+      normalizeStringArray(exifData.Keywords),
+      normalizeStringArray(exifData.WeightedFlatSubject),
+      normalizeStringArray(exifData.HierarchicalSubject),
+    ),
+    regions: parseRegionInfo(exifData.RegionInfo),
+  }
+}
+
+function handleExifData(exifData: Tags): PickedExif {
   const date = {
     DateTimeOriginal: formatExifDate(exifData.DateTimeOriginal),
     DateTimeDigitized: formatExifDate(exifData.DateTimeDigitized),
@@ -149,12 +193,12 @@ function handleExifData(exifData: Tags, metadata: Metadata): PickedExif {
       ColorChromeEffect: exifData.ColorChromeEffect,
       ColorChromeFxBlue: exifData.ColorChromeFXBlue,
       WhiteBalance: exifData.WhiteBalance,
-      WhiteBalanceFineTune: exifData.WhiteBalanceFineTune,
+
       DynamicRange: exifData.DynamicRange,
       HighlightTone: exifData.HighlightTone,
       ShadowTone: exifData.ShadowTone,
       Saturation: exifData.Saturation,
-      Sharpness: exifData.Sharpness,
+      // Sharpness: exifData.Sharpness,
       NoiseReduction: exifData.NoiseReduction,
       Clarity: exifData.Clarity,
       ColorTemperature: exifData.ColorTemperature,
@@ -173,8 +217,8 @@ function handleExifData(exifData: Tags, metadata: Metadata): PickedExif {
     }
   }
   const size = {
-    ImageWidth: exifData.ExifImageWidth || metadata.width,
-    ImageHeight: exifData.ExifImageHeight || metadata.height,
+    ImageWidth: exifData.ExifImageWidth,
+    ImageHeight: exifData.ExifImageHeight,
   }
   const result: any = structuredClone(exifData)
   for (const key in result) {
@@ -204,4 +248,96 @@ const formatExifDate = (date: string | ExifDateTime | undefined) => {
   }
 
   return date.toISOString()
+}
+
+function parseRegionInfo(regionInfo: ExiftoolXmpRegionInfo | undefined): PhotoRegion[] {
+  if (!regionInfo?.RegionList || regionInfo.RegionList.length === 0) {
+    return []
+  }
+
+  const appliedToDimensions = parseAppliedToDimensions(regionInfo.AppliedToDimensions)
+
+  return regionInfo.RegionList.map((region) => {
+    const name = typeof region.Name === 'string' ? region.Name.trim() : ''
+    const type = normalizeRegionType(region.Type)
+    const area = parseRegionArea(region.Area)
+
+    if (!name && !type && !area) {
+      return null
+    }
+
+    return {
+      name,
+      ...(type ? { type } : {}),
+      area,
+      appliedToDimensions,
+    } satisfies PhotoRegion
+  }).filter((region): region is PhotoRegion => region !== null)
+}
+
+function parseAppliedToDimensions(dimensions: ExiftoolXmpDimensions | undefined) {
+  if (!dimensions?.W || !dimensions?.H || !dimensions.Unit) {
+    return null
+  }
+
+  return {
+    width: dimensions.W,
+    height: dimensions.H,
+    unit: dimensions.Unit,
+  }
+}
+
+function parseRegionArea(area: ExiftoolXmpArea | undefined) {
+  if (
+    typeof area?.X !== 'number'
+    || typeof area.Y !== 'number'
+    || typeof area.W !== 'number'
+    || typeof area.H !== 'number'
+  ) {
+    return null
+  }
+
+  return {
+    x: area.X,
+    y: area.Y,
+    width: area.W,
+    height: area.H,
+    unit: area.Unit ?? 'normalized',
+  }
+}
+
+function normalizeRegionType(type: string | undefined): string | undefined {
+  if (!type) {
+    return undefined
+  }
+
+  const normalized = type.trim()
+  const groupedType = normalized.match(/\(([^)]+)\)\s*$/)?.[1]?.trim()
+  return groupedType || normalized || undefined
+}
+
+function normalizeStringArray(input: string[] | undefined): string[] {
+  if (!Array.isArray(input)) {
+    return []
+  }
+
+  return input.map(value => value.trim()).filter(Boolean)
+}
+
+function mergeUniqueStrings(...groups: string[][]): string[] {
+  const seen = new Set<string>()
+  const merged: string[] = []
+
+  for (const group of groups) {
+    for (const value of group) {
+      if (!value || seen.has(value)) {
+        continue
+      }
+
+      seen.add(value)
+      merged.push(value)
+    }
+  }
+
+  return merged
 }

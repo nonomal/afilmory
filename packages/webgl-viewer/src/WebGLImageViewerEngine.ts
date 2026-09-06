@@ -1,11 +1,7 @@
 import { LoadingState } from './enum'
 import { ImageViewerEngineBase } from './ImageViewerEngineBase'
-import type { DebugInfo, WebGLImageViewerProps } from './interface'
-import {
-  createShader,
-  FRAGMENT_SHADER_SOURCE,
-  VERTEX_SHADER_SOURCE,
-} from './shaders'
+import type { DebugInfo, WebGLImageViewerProps, WebGLViewportState } from './interface'
+import { createShader, FRAGMENT_SHADER_SOURCE, VERTEX_SHADER_SOURCE } from './shaders'
 import TextureWorkerRaw from './texture.worker?raw'
 
 // 瓦片系统配置
@@ -22,6 +18,11 @@ interface TileInfo {
   lastUsed: number // 最后使用时间
   isLoading: boolean // 是否正在加载
   priority: number // 优先级（距离视口中心的距离）
+}
+
+interface PendingTileRequest {
+  key: TileKey
+  priority: number
 }
 
 // 瓦片键值
@@ -87,19 +88,33 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   // 配置和回调
   private config: Required<WebGLImageViewerProps>
   private onZoomChange?: (originalScale: number, relativeScale: number) => void
+  private onViewportChange?: (viewport: WebGLViewportState) => void
   private onImageCopied?: () => void
   private onLoadingStateChange?: (
     isLoading: boolean,
     state?: LoadingState,
     quality?: 'high' | 'medium' | 'low' | 'unknown',
   ) => void
-  private onDebugUpdate?: React.RefObject<(debugInfo: any) => void>
+
+  private onDebugUpdate?: React.RefObject<(debugInfo: DebugInfo) => void>
 
   // 当前质量状态
   private currentQuality: 'high' | 'medium' | 'low' | 'unknown' = 'unknown'
   private isLoadingTexture = true
   private worker: Worker | null = null
   private textureWorkerInitialized = false
+
+  // WebGL attribute/uniform缓存
+  private positionBuffer: WebGLBuffer | null = null
+  private texCoordBuffer: WebGLBuffer | null = null
+  private tileOutlineBuffer: WebGLBuffer | null = null
+  private positionLocation = -1
+  private texCoordLocation = -1
+  private matrixLocation!: WebGLUniformLocation
+  private imageLocation!: WebGLUniformLocation
+  private renderModeLocation!: WebGLUniformLocation
+  private solidColorLocation!: WebGLUniformLocation
+  private tileOutlineEnabled = false
 
   // 事件处理器绑定
   private boundHandleMouseDown: (e: MouseEvent) => void
@@ -115,11 +130,13 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   // 瓦片系统
   private tileCache = new Map<TileKey, TileInfo>()
   private loadingTiles = new Map<TileKey, { priority: number }>()
-  private pendingTileRequests: Array<{ key: TileKey; priority: number }> = []
+  private pendingTileRequests: PendingTileRequest[] = []
+  private tileProcessingFrameId: number | null = null
 
   // 可视区域信息
   private currentVisibleTiles = new Set<TileKey>()
   private lastViewportHash = ''
+  private lastViewportNotificationKey = ''
 
   // Promise resolvers for loadImage
   private loadImageResolve: (() => void) | null = null
@@ -134,6 +151,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     this.canvas = canvas
     this.config = config
     this.onZoomChange = config.onZoomChange
+    this.onViewportChange = config.onViewportChange
     this.onImageCopied = config.onImageCopied
     this.onLoadingStateChange = config.onLoadingStateChange
     this.onDebugUpdate = onDebugUpdate
@@ -179,7 +197,10 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       this.resizeObserver.disconnect()
     }
     this.resizeObserver = new ResizeObserver((e) => {
-      if (e[0].target !== this.canvas) return
+      if (e[0].target !== this.canvas) {
+        return
+      }
+
       this.boundResizeCanvas()
     })
     this.resizeObserver.observe(this.canvas)
@@ -210,16 +231,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const { gl } = this
 
     // 创建着色器
-    const vertexShader = createShader(
-      gl,
-      gl.VERTEX_SHADER,
-      VERTEX_SHADER_SOURCE,
-    )
-    const fragmentShader = createShader(
-      gl,
-      gl.FRAGMENT_SHADER,
-      FRAGMENT_SHADER_SOURCE,
-    )
+    const vertexShader = createShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SOURCE)
+    const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE)
 
     // 创建程序
     this.program = gl.createProgram()!
@@ -228,49 +241,121 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     gl.linkProgram(this.program)
 
     if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
-      throw new Error(
-        `Program linking failed: ${gl.getProgramInfoLog(this.program)}`,
-      )
+      throw new Error(`Program linking failed: ${gl.getProgramInfoLog(this.program)}`)
     }
 
     gl.useProgram(this.program)
+
+    this.positionLocation = gl.getAttribLocation(this.program, 'a_position')
+    this.texCoordLocation = gl.getAttribLocation(this.program, 'a_texCoord')
+
+    if (this.positionLocation === -1 || this.texCoordLocation === -1) {
+      throw new Error('Failed to get attribute locations')
+    }
+
+    const matrixLocation = gl.getUniformLocation(this.program, 'u_matrix')
+    const imageLocation = gl.getUniformLocation(this.program, 'u_image')
+    const renderModeLocation = gl.getUniformLocation(this.program, 'u_renderMode')
+    const solidColorLocation = gl.getUniformLocation(this.program, 'u_solidColor')
+
+    if (!matrixLocation || !imageLocation || !renderModeLocation || !solidColorLocation) {
+      throw new Error('Failed to get uniform locations')
+    }
+
+    this.matrixLocation = matrixLocation
+    this.imageLocation = imageLocation
+    this.renderModeLocation = renderModeLocation
+    this.solidColorLocation = solidColorLocation
 
     // 启用混合
     gl.enable(gl.BLEND)
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
 
     // 创建几何体
-    const positions = new Float32Array([
-      -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1,
-    ])
+    const positions = new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1])
     const texCoords = new Float32Array([0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0])
 
     // 位置缓冲
     const positionBuffer = gl.createBuffer()
+    if (!positionBuffer) {
+      throw new Error('Failed to create position buffer')
+    }
+    this.positionBuffer = positionBuffer
     gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer)
     gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW)
 
-    const positionLocation = gl.getAttribLocation(this.program, 'a_position')
-    gl.enableVertexAttribArray(positionLocation)
-    gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0)
-
     // 纹理坐标缓冲
     const texCoordBuffer = gl.createBuffer()
+    if (!texCoordBuffer) {
+      throw new Error('Failed to create texCoord buffer')
+    }
+    this.texCoordBuffer = texCoordBuffer
     gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer)
     gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.STATIC_DRAW)
 
-    const texCoordLocation = gl.getAttribLocation(this.program, 'a_texCoord')
-    gl.enableVertexAttribArray(texCoordLocation)
-    gl.vertexAttribPointer(texCoordLocation, 2, gl.FLOAT, false, 0, 0)
+    // 绘制瓦片描边的线框缓冲
+    const outlinePositions = new Float32Array([-1, -1, 1, -1, 1, 1, -1, 1])
+    const outlineBuffer = gl.createBuffer()
+    if (!outlineBuffer) {
+      throw new Error('Failed to create outline buffer')
+    }
+    this.tileOutlineBuffer = outlineBuffer
+    gl.bindBuffer(gl.ARRAY_BUFFER, outlineBuffer)
+    gl.bufferData(gl.ARRAY_BUFFER, outlinePositions, gl.STATIC_DRAW)
+
+    gl.enableVertexAttribArray(this.positionLocation)
+    gl.enableVertexAttribArray(this.texCoordLocation)
+
+    this.bindQuadBuffers()
+    gl.uniform1i(this.renderModeLocation, 0)
+  }
+
+  private bindQuadBuffers() {
+    if (!this.positionBuffer || !this.texCoordBuffer) {
+      return
+    }
+
+    const { gl } = this
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer)
+    gl.vertexAttribPointer(this.positionLocation, 2, gl.FLOAT, false, 0, 0)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer)
+    gl.vertexAttribPointer(this.texCoordLocation, 2, gl.FLOAT, false, 0, 0)
+  }
+
+  private bindOutlineBuffer() {
+    if (!this.tileOutlineBuffer) {
+      return
+    }
+
+    const { gl } = this
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.tileOutlineBuffer)
+    gl.vertexAttribPointer(this.positionLocation, 2, gl.FLOAT, false, 0, 0)
+  }
+
+  private drawTileOutlines(tileMatrices: Float32Array[]) {
+    if (!this.tileOutlineEnabled || tileMatrices.length === 0 || !this.tileOutlineBuffer) {
+      return
+    }
+
+    const { gl } = this
+    gl.uniform1i(this.renderModeLocation, 1)
+    gl.uniform4f(this.solidColorLocation, 1, 0.4, 0, 0.7)
+    this.bindOutlineBuffer()
+    gl.lineWidth(1)
+
+    for (const matrix of tileMatrices) {
+      gl.uniformMatrix3fv(this.matrixLocation, false, matrix)
+      gl.drawArrays(gl.LINE_LOOP, 0, 4)
+    }
+
+    this.bindQuadBuffers()
+    gl.uniform1i(this.renderModeLocation, 0)
   }
 
   private initWorker() {
-    this.worker = new Worker(
-      URL.createObjectURL(new Blob([TextureWorkerRaw])),
-      {
-        name: 'texture-worker',
-      },
-    )
+    this.worker = new Worker(URL.createObjectURL(new Blob([TextureWorkerRaw])), {
+      name: 'texture-worker',
+    })
 
     this.worker.onmessage = (e: MessageEvent) => {
       this.handleWorkerMessage(e)
@@ -303,12 +388,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
           this.lodTextures.set(lodLevel, texture)
           this.texture = texture
           this.currentLOD = lodLevel
-          this.currentQuality =
-            SIMPLE_LOD_LEVELS[lodLevel].scale >= 2
-              ? 'high'
-              : SIMPLE_LOD_LEVELS[lodLevel].scale >= 1
-                ? 'medium'
-                : 'low'
+          this.currentQuality
+            = SIMPLE_LOD_LEVELS[lodLevel].scale >= 2 ? 'high' : SIMPLE_LOD_LEVELS[lodLevel].scale >= 1 ? 'medium' : 'low'
         }
 
         this.imageLoaded = true
@@ -319,7 +400,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
         if (this.loadImageResolve) {
           this.loadImageResolve()
         }
-      } catch (error) {
+      }
+      catch (error) {
         if (this.loadImageReject) {
           this.loadImageReject(error as Error)
         }
@@ -369,11 +451,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
           texture,
           lastUsed: performance.now(),
           isLoading: false,
-          priority: loadingInfo
-            ? loadingInfo.priority
-            : tileInfoInCache
-              ? tileInfoInCache.priority
-              : 0,
+          priority: loadingInfo ? loadingInfo.priority : tileInfoInCache ? tileInfoInCache.priority : 0,
         }
         this.tileCache.set(key, tileInfo)
 
@@ -384,21 +462,19 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
         if (this.currentVisibleTiles.has(key)) {
           this.render()
         }
-      } else if (loadingInfo) {
+      }
+      else if (loadingInfo) {
         this.loadingTiles.delete(key)
       }
-    } else if (type === 'tile-error') {
+    }
+    else if (type === 'tile-error') {
       const { key, error } = payload
       console.warn(`Worker failed to create tile: ${key}`, error)
       this.loadingTiles.delete(key)
     }
   }
 
-  async loadImage(
-    url: string,
-    preknownWidth?: number,
-    preknownHeight?: number,
-  ) {
+  async loadImage(url: string, preknownWidth?: number, preknownHeight?: number) {
     this.originalImageSrc = url
     this.isLoadingTexture = true
     this.notifyLoadingStateChange(true, LoadingState.IMAGE_LOADING)
@@ -413,7 +489,6 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       this.loadImageResolve = resolve
       this.loadImageReject = reject
 
-      console.info('[Engine] Posting "load-image" to worker', this.worker)
       this.worker?.postMessage({
         type: 'load-image',
         payload: { url },
@@ -424,19 +499,20 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   private setupInitialScaling() {
     if (this.config.centerOnInit) {
       this.fitImageToScreen()
-    } else {
+    }
+    else {
       const fitToScreenScale = this.getFitToScreenScale()
       this.scale = fitToScreenScale * this.config.initialScale
     }
   }
 
-  private createWebGLTexture(
-    source: HTMLCanvasElement | HTMLImageElement | ImageBitmap,
-  ): WebGLTexture | null {
+  private createWebGLTexture(source: HTMLCanvasElement | HTMLImageElement | ImageBitmap): WebGLTexture | null {
     const { gl } = this
 
     const texture = gl.createTexture()
-    if (!texture) return null
+    if (!texture) {
+      return null
+    }
 
     gl.bindTexture(gl.TEXTURE_2D, texture)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
@@ -460,7 +536,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     if (this.isAnimating && this.animationStartLOD > -1) {
       return this.animationStartLOD
     }
-    if (!this.imageLoaded) return 1
+    if (!this.imageLoaded) {
+      return 1
+    }
 
     const requiredScale = this.scale * this.devicePixelRatio
 
@@ -478,7 +556,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
   // 缓动函数
   private easeOutQuart(t: number): number {
-    return 1 - Math.pow(1 - t, 4)
+    return 1 - (1 - t) ** 4
   }
 
   private startAnimation(
@@ -520,30 +598,26 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   }
 
   private animate() {
-    if (!this.isAnimating) return
+    if (!this.isAnimating) {
+      return
+    }
 
     const now = performance.now()
     const elapsed = now - this.animationStartTime
     const progress = Math.min(elapsed / this.animationDuration, 1)
-    const easedProgress = this.config.smooth
-      ? this.easeOutQuart(progress)
-      : progress
+    const easedProgress = this.config.smooth ? this.easeOutQuart(progress) : progress
 
-    this.scale =
-      this.startScale + (this.targetScale - this.startScale) * easedProgress
-    this.translateX =
-      this.startTranslateX +
-      (this.targetTranslateX - this.startTranslateX) * easedProgress
-    this.translateY =
-      this.startTranslateY +
-      (this.targetTranslateY - this.startTranslateY) * easedProgress
+    this.scale = this.startScale + (this.targetScale - this.startScale) * easedProgress
+    this.translateX = this.startTranslateX + (this.targetTranslateX - this.startTranslateX) * easedProgress
+    this.translateY = this.startTranslateY + (this.targetTranslateY - this.startTranslateY) * easedProgress
 
     this.render()
     this.notifyZoomChange()
 
     if (progress < 1) {
       requestAnimationFrame(() => this.animate())
-    } else {
+    }
+    else {
       this.isAnimating = false
       this.animationStartLOD = -1
       this.scale = this.targetScale
@@ -573,17 +647,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const translateX = (this.translateX * 2) / this.canvasWidth
     const translateY = -(this.translateY * 2) / this.canvasHeight
 
-    return new Float32Array([
-      scaleX,
-      0,
-      0,
-      0,
-      scaleY,
-      0,
-      translateX,
-      translateY,
-      1,
-    ])
+    return new Float32Array([scaleX, 0, 0, 0, scaleY, 0, translateX, translateY, 1])
   }
 
   private getFitToScreenScale(): number {
@@ -593,7 +657,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   }
 
   private constrainImagePosition() {
-    if (!this.config.limitToBounds) return
+    if (!this.config.limitToBounds) {
+      return
+    }
 
     const fitScale = this.getFitToScreenScale()
 
@@ -608,14 +674,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const maxTranslateX = Math.max(0, (scaledWidth - this.canvasWidth) / 2)
     const maxTranslateY = Math.max(0, (scaledHeight - this.canvasHeight) / 2)
 
-    this.translateX = Math.max(
-      -maxTranslateX,
-      Math.min(maxTranslateX, this.translateX),
-    )
-    this.translateY = Math.max(
-      -maxTranslateY,
-      Math.min(maxTranslateY, this.translateY),
-    )
+    this.translateX = Math.max(-maxTranslateX, Math.min(maxTranslateX, this.translateX))
+    this.translateY = Math.max(-maxTranslateY, Math.min(maxTranslateY, this.translateY))
   }
 
   private constrainScaleAndPosition() {
@@ -627,7 +687,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
     if (this.scale < absoluteMinScale) {
       this.scale = absoluteMinScale
-    } else if (this.scale > effectiveMaxScale) {
+    }
+    else if (this.scale > effectiveMaxScale) {
       this.scale = effectiveMaxScale
     }
 
@@ -639,7 +700,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     return `${x}-${y}-${lodLevel}`
   }
 
-  private getTileGridSize(lodLevel: number): { cols: number; rows: number } {
+  private getTileGridSize(lodLevel: number): { cols: number, rows: number } {
     const lodConfig = SIMPLE_LOD_LEVELS[lodLevel]
     const scaledWidth = this.imageWidth * lodConfig.scale
     const scaledHeight = this.imageHeight * lodConfig.scale
@@ -656,7 +717,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     lodLevel: number
     priority: number
   }> {
-    if (!this.imageLoaded) return []
+    if (!this.imageLoaded) {
+      return []
+    }
 
     const lodLevel = this.selectOptimalLOD()
     const { cols, rows } = this.getTileGridSize(lodLevel)
@@ -677,14 +740,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     // 可视区域在图像坐标中的范围 (0 到 imageWidth/Height)
     const viewLeft = Math.max(0, -imageLeftInCanvas / this.scale)
     const viewTop = Math.max(0, -imageTopInCanvas / this.scale)
-    const viewRight = Math.min(
-      this.imageWidth,
-      (this.canvasWidth - imageLeftInCanvas) / this.scale,
-    )
-    const viewBottom = Math.min(
-      this.imageHeight,
-      (this.canvasHeight - imageTopInCanvas) / this.scale,
-    )
+    const viewRight = Math.min(this.imageWidth, (this.canvasWidth - imageLeftInCanvas) / this.scale)
+    const viewBottom = Math.min(this.imageHeight, (this.canvasHeight - imageTopInCanvas) / this.scale)
 
     // 计算瓦片大小在原图坐标中的尺寸
     const tileWidthInImage = this.imageWidth / cols
@@ -692,22 +749,10 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
     // 计算需要的瓦片范围
     const margin = 1 // 额外加载 1 个瓦片的边距
-    const startTileX = Math.max(
-      0,
-      Math.floor(viewLeft / tileWidthInImage) - margin,
-    )
-    const endTileX = Math.min(
-      cols - 1,
-      Math.ceil(viewRight / tileWidthInImage) + margin,
-    )
-    const startTileY = Math.max(
-      0,
-      Math.floor(viewTop / tileHeightInImage) - margin,
-    )
-    const endTileY = Math.min(
-      rows - 1,
-      Math.ceil(viewBottom / tileHeightInImage) + margin,
-    )
+    const startTileX = Math.max(0, Math.floor(viewLeft / tileWidthInImage) - margin)
+    const endTileX = Math.min(cols - 1, Math.ceil(viewRight / tileWidthInImage) + margin)
+    const startTileY = Math.max(0, Math.floor(viewTop / tileHeightInImage) - margin)
+    const endTileY = Math.min(rows - 1, Math.ceil(viewBottom / tileHeightInImage) + margin)
 
     const visibleTiles: Array<{
       x: number
@@ -725,10 +770,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
         // 计算瓦片中心到视口中心的距离作为优先级
         const tileCenterX = (x + 0.5) * tileWidthInImage
         const tileCenterY = (y + 0.5) * tileHeightInImage
-        const distance = Math.sqrt(
-          Math.pow(tileCenterX - viewCenterX, 2) +
-            Math.pow(tileCenterY - viewCenterY, 2),
-        )
+        const distance = Math.hypot(tileCenterX - viewCenterX, tileCenterY - viewCenterY)
 
         visibleTiles.push({
           x,
@@ -751,22 +793,27 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
     // 创建当前视口的哈希，用于检测视口变化
     const viewportHash = `${this.scale.toFixed(3)}-${this.translateX.toFixed(1)}-${this.translateY.toFixed(1)}`
-
-    // 如果视口没有显著变化，跳过更新
-    if (viewportHash === this.lastViewportHash) {
-      return
-    }
-
+    const viewportChanged = viewportHash !== this.lastViewportHash
     this.lastViewportHash = viewportHash
+
+    let addedNewRequest = false
 
     // 标记需要的瓦片
     for (const tile of visibleTiles) {
       const key = this.getTileKey(tile.x, tile.y, tile.lodLevel)
       newVisibleTiles.add(key)
 
-      if (!this.tileCache.has(key) && !this.loadingTiles.has(key)) {
+      const pendingRequest = this.pendingTileRequests.find(request => request.key === key)
+
+      if (!this.tileCache.has(key) && !this.loadingTiles.has(key) && !pendingRequest) {
         this.pendingTileRequests.push({ key, priority: tile.priority })
-      } else if (this.tileCache.has(key)) {
+        addedNewRequest = true
+      }
+      else if (pendingRequest) {
+        // Update priority when tile stays in view to keep ordering useful
+        pendingRequest.priority = Math.min(pendingRequest.priority, tile.priority)
+      }
+      else if (this.tileCache.has(key)) {
         // 更新使用时间
         const tileInfo = this.tileCache.get(key)!
         tileInfo.lastUsed = performance.now()
@@ -774,12 +821,11 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     }
 
     this.currentVisibleTiles = newVisibleTiles
-
-    // 清理不再需要的瓦片
     this.cleanupOldTiles()
 
-    // 处理待加载的瓦片请求
-    this.processPendingTileRequests()
+    if (viewportChanged || addedNewRequest || this.pendingTileRequests.length > 0) {
+      this.processPendingTileRequests()
+    }
   }
 
   private cleanupOldTiles(): void {
@@ -803,10 +849,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
     // 清理过期的瓦片
     for (const [key, tileInfo] of this.tileCache.entries()) {
-      if (
-        !this.currentVisibleTiles.has(key) &&
-        now - tileInfo.lastUsed > maxAge
-      ) {
+      if (!this.currentVisibleTiles.has(key) && now - tileInfo.lastUsed > maxAge) {
         if (tileInfo.texture) {
           this.gl.deleteTexture(tileInfo.texture)
         }
@@ -816,19 +859,24 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   }
 
   private processPendingTileRequests(): void {
-    if (
-      this.pendingTileRequests.length === 0 ||
-      !this.worker ||
-      !this.textureWorkerInitialized
-    ) {
+    if (!this.worker || !this.textureWorkerInitialized) {
+      return
+    }
+
+    if (this.pendingTileRequests.length === 0) {
+      if (this.tileProcessingFrameId !== null) {
+        cancelAnimationFrame(this.tileProcessingFrameId)
+        this.tileProcessingFrameId = null
+      }
       return
     }
 
     // 按优先级排序
     this.pendingTileRequests.sort((a, b) => a.priority - b.priority)
 
-    // 限制并发加载数量
-    const batch = this.pendingTileRequests.splice(0, MAX_TILES_PER_FRAME)
+    const halfCount = Math.max(1, Math.ceil(this.pendingTileRequests.length / 2))
+    const batchSize = Math.min(MAX_TILES_PER_FRAME, halfCount)
+    const batch = this.pendingTileRequests.splice(0, batchSize)
 
     for (const request of batch) {
       const { key, priority } = request
@@ -855,24 +903,34 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
         },
       })
     }
+
+    if (this.pendingTileRequests.length > 0 && this.tileProcessingFrameId === null) {
+      this.tileProcessingFrameId = requestAnimationFrame(() => {
+        this.tileProcessingFrameId = null
+        this.processPendingTileRequests()
+      })
+    }
   }
 
   // 修改渲染方法以支持瓦片渲染
   private render() {
     const { gl } = this
 
+    if (!this.positionBuffer || !this.texCoordBuffer) {
+      return
+    }
+
     gl.viewport(0, 0, this.canvas.width, this.canvas.height)
     gl.clearColor(0, 0, 0, 0)
     gl.clear(gl.COLOR_BUFFER_BIT)
     gl.useProgram(this.program)
-
-    const matrixLocation = gl.getUniformLocation(this.program, 'u_matrix')
-    const imageLocation = gl.getUniformLocation(this.program, 'u_image')
+    this.bindQuadBuffers()
+    gl.uniform1i(this.renderModeLocation, 0)
 
     // 始终渲染一个低分辨率的底图作为回退，防止瓦片加载过程中出现空白
     if (this.texture) {
-      gl.uniformMatrix3fv(matrixLocation, false, this.createMatrix())
-      gl.uniform1i(imageLocation, 0)
+      gl.uniformMatrix3fv(this.matrixLocation, false, this.createMatrix())
+      gl.uniform1i(this.imageLocation, 0)
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, this.texture)
       gl.drawArrays(gl.TRIANGLES, 0, 6)
@@ -880,6 +938,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
     // 渲染可见的瓦片
     const lodLevel = this.selectOptimalLOD()
+    const outlinedTileMatrices: Float32Array[] = []
 
     for (const tileKey of this.currentVisibleTiles) {
       const tileInfo = this.tileCache.get(tileKey)
@@ -888,38 +947,33 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       }
 
       // 计算瓦片的渲染变换矩阵
-      const tileMatrix = this.createTileMatrix(
-        tileInfo.x,
-        tileInfo.y,
-        tileInfo.lodLevel,
-      )
-      gl.uniformMatrix3fv(matrixLocation, false, tileMatrix)
+      const tileMatrix = this.createTileMatrix(tileInfo.x, tileInfo.y, tileInfo.lodLevel)
+      gl.uniformMatrix3fv(this.matrixLocation, false, tileMatrix)
 
-      gl.uniform1i(imageLocation, 0)
+      gl.uniform1i(this.imageLocation, 0)
       gl.activeTexture(gl.TEXTURE0)
       gl.bindTexture(gl.TEXTURE_2D, tileInfo.texture)
       gl.drawArrays(gl.TRIANGLES, 0, 6)
+      if (this.tileOutlineEnabled) {
+        outlinedTileMatrices.push(tileMatrix)
+      }
     }
+
+    this.drawTileOutlines(outlinedTileMatrices)
 
     // 更新调试信息
     this.updateDebugInfo()
+    this.notifyViewportChange()
 
     // 定期更新瓦片缓存
-    if (
-      !this.isAnimating &&
-      performance.now() - this.lastTileUpdateTime > 100
-    ) {
+    if (!this.isAnimating && performance.now() - this.lastTileUpdateTime > 100) {
       // 100ms 防抖
       this.lastTileUpdateTime = performance.now()
       setTimeout(() => this.updateTileCache(), 0)
     }
   }
 
-  private createTileMatrix(
-    tileX: number,
-    tileY: number,
-    lodLevel: number,
-  ): Float32Array {
+  private createTileMatrix(tileX: number, tileY: number, lodLevel: number): Float32Array {
     const { cols, rows } = this.getTileGridSize(lodLevel)
 
     // 计算瓦片在原图中的区域
@@ -929,14 +983,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     // 瓦片在原图中的边界
     const tileLeftInImage = tileX * tileWidthInImage
     const tileTopInImage = tileY * tileHeightInImage
-    const tileRightInImage = Math.min(
-      this.imageWidth,
-      tileLeftInImage + tileWidthInImage,
-    )
-    const tileBottomInImage = Math.min(
-      this.imageHeight,
-      tileTopInImage + tileHeightInImage,
-    )
+    const tileRightInImage = Math.min(this.imageWidth, tileLeftInImage + tileWidthInImage)
+    const tileBottomInImage = Math.min(this.imageHeight, tileTopInImage + tileHeightInImage)
 
     // 瓦片的实际尺寸（处理边界情况）
     const actualTileWidth = tileRightInImage - tileLeftInImage
@@ -951,10 +999,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const tileCenterRelativeY = tileCenterInImageY - this.imageHeight / 2
 
     // 计算瓦片在 canvas 中的位置
-    const tileCenterInCanvasX =
-      this.canvasWidth / 2 + this.translateX + tileCenterRelativeX * this.scale
-    const tileCenterInCanvasY =
-      this.canvasHeight / 2 + this.translateY + tileCenterRelativeY * this.scale
+    const tileCenterInCanvasX = this.canvasWidth / 2 + this.translateX + tileCenterRelativeX * this.scale
+    const tileCenterInCanvasY = this.canvasHeight / 2 + this.translateY + tileCenterRelativeY * this.scale
 
     // 计算瓦片在 canvas 中的尺寸
     const tileWidthInCanvas = actualTileWidth * this.scale
@@ -967,17 +1013,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const translateX = (tileCenterInCanvasX * 2) / this.canvasWidth - 1
     const translateY = -((tileCenterInCanvasY * 2) / this.canvasHeight - 1)
 
-    return new Float32Array([
-      scaleX,
-      0,
-      0,
-      0,
-      scaleY,
-      0,
-      translateX,
-      translateY,
-      1,
-    ])
+    return new Float32Array([scaleX, 0, 0, 0, scaleY, 0, translateX, translateY, 1])
   }
 
   // 添加瓦片更新时间追踪
@@ -1006,6 +1042,52 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     return this.scale
   }
 
+  public updateCallbacks({
+    onZoomChange,
+    onViewportChange,
+    onImageCopied,
+    onLoadingStateChange,
+  }: Pick<
+    Required<WebGLImageViewerProps>,
+    'onZoomChange' | 'onViewportChange' | 'onImageCopied' | 'onLoadingStateChange'
+  >) {
+    this.onZoomChange = onZoomChange
+    this.onViewportChange = onViewportChange
+    this.onImageCopied = onImageCopied
+    this.onLoadingStateChange = onLoadingStateChange
+    this.lastViewportNotificationKey = ''
+    this.notifyViewportChange()
+  }
+
+  public updateInteractionConfig({
+    wheel,
+    pinch,
+    doubleClick,
+    panning,
+  }: Pick<Required<WebGLImageViewerProps>, 'wheel' | 'pinch' | 'doubleClick' | 'panning'>) {
+    this.config.wheel = wheel
+    this.config.pinch = pinch
+    this.config.doubleClick = doubleClick
+    this.config.panning = panning
+
+    if (panning.disabled) {
+      this.isDragging = false
+    }
+
+    if (pinch.disabled) {
+      this.lastTouchDistance = 0
+    }
+  }
+
+  public setTileOutlineEnabled(enabled: boolean) {
+    this.tileOutlineEnabled = enabled
+    this.render()
+  }
+
+  public isTileOutlineEnabled(): boolean {
+    return this.tileOutlineEnabled
+  }
+
   public destroy() {
     // 清理事件监听器
     window.removeEventListener('resize', this.boundResizeCanvas)
@@ -1023,6 +1105,18 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     if (this.texture) {
       this.gl.deleteTexture(this.texture)
     }
+    if (this.positionBuffer) {
+      this.gl.deleteBuffer(this.positionBuffer)
+      this.positionBuffer = null
+    }
+    if (this.texCoordBuffer) {
+      this.gl.deleteBuffer(this.texCoordBuffer)
+      this.texCoordBuffer = null
+    }
+    if (this.tileOutlineBuffer) {
+      this.gl.deleteBuffer(this.tileOutlineBuffer)
+      this.tileOutlineBuffer = null
+    }
     if (this.program) {
       this.gl.deleteProgram(this.program)
     }
@@ -1030,11 +1124,18 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       this.resizeObserver.disconnect()
     }
 
+    if (this.tileProcessingFrameId !== null) {
+      cancelAnimationFrame(this.tileProcessingFrameId)
+      this.tileProcessingFrameId = null
+    }
+
     this.worker?.terminate()
   }
 
   private updateDebugInfo() {
-    if (!this.onDebugUpdate?.current) return
+    if (!this.onDebugUpdate?.current) {
+      return
+    }
 
     const fitToScreenScale = this.getFitToScreenScale()
     const relativeScale = this.scale / fitToScreenScale
@@ -1059,7 +1160,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       cacheKeys: Array.from(this.tileCache.keys()),
       visibleKeys: Array.from(this.currentVisibleTiles),
       loadingKeys: Array.from(this.loadingTiles.keys()),
-      pendingKeys: this.pendingTileRequests.map((req) => req.key),
+      pendingKeys: this.pendingTileRequests.map(req => req.key),
     }
 
     this.onDebugUpdate.current({
@@ -1088,6 +1189,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
         maxConcurrentLODs: 3,
         onDemandStrategy: true,
       },
+      tileOutlinesEnabled: this.tileOutlineEnabled,
       tileSystem: tileSystemInfo,
     })
   }
@@ -1101,6 +1203,41 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     }
   }
 
+  private notifyViewportChange() {
+    if (!this.onViewportChange || !this.imageLoaded) {
+      return
+    }
+
+    const fitToScreenScale = this.getFitToScreenScale()
+    const relativeScale = this.scale / fitToScreenScale
+    const notificationKey = [
+      this.canvasWidth,
+      this.canvasHeight,
+      this.imageWidth,
+      this.imageHeight,
+      this.scale.toFixed(4),
+      this.translateX.toFixed(2),
+      this.translateY.toFixed(2),
+    ].join(':')
+
+    if (notificationKey === this.lastViewportNotificationKey) {
+      return
+    }
+
+    this.lastViewportNotificationKey = notificationKey
+    this.onViewportChange({
+      containerWidth: this.canvasWidth,
+      containerHeight: this.canvasHeight,
+      imageWidth: this.imageWidth,
+      imageHeight: this.imageHeight,
+      scale: this.scale,
+      relativeScale,
+      fitToScreenScale,
+      translateX: this.translateX,
+      translateY: this.translateY,
+    })
+  }
+
   private notifyLoadingStateChange(
     isLoading: boolean,
 
@@ -1108,11 +1245,7 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     quality?: 'high' | 'medium' | 'low' | 'unknown',
   ) {
     if (this.onLoadingStateChange) {
-      this.onLoadingStateChange(
-        isLoading,
-        state,
-        quality || this.currentQuality,
-      )
+      this.onLoadingStateChange(isLoading, state, quality || this.currentQuality)
     }
   }
 
@@ -1133,7 +1266,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       this.isAnimating = false
       this.animationStartLOD = -1
     }
-    if (this.config.panning.disabled) return
+    if (this.config.panning.disabled) {
+      return
+    }
 
     this.isDragging = true
     this.lastMouseX = e.clientX
@@ -1141,7 +1276,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   }
 
   private handleMouseMove(e: MouseEvent) {
-    if (!this.isDragging || this.config.panning.disabled) return
+    if (!this.isDragging || this.config.panning.disabled) {
+      return
+    }
 
     const deltaX = e.clientX - this.lastMouseX
     const deltaY = e.clientY - this.lastMouseY
@@ -1162,7 +1299,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
   private handleWheel(e: WheelEvent) {
     e.preventDefault()
-    if (this.config.wheel.wheelDisabled) return
+    if (this.config.wheel.wheelDisabled) {
+      return
+    }
 
     if (this.isAnimating) {
       this.isAnimating = false
@@ -1173,17 +1312,21 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const mouseX = e.clientX - rect.left
     const mouseY = e.clientY - rect.top
 
-    const scaleFactor =
-      e.deltaY > 0 ? 1 - this.config.wheel.step : 1 + this.config.wheel.step
+    const scaleFactor = e.deltaY > 0 ? 1 - this.config.wheel.step : 1 + this.config.wheel.step
     this.zoomAt(mouseX, mouseY, scaleFactor)
   }
 
   private handleDoubleClick(e: MouseEvent) {
     e.preventDefault()
-    if (this.config.doubleClick.disabled) return
+    if (this.config.doubleClick.disabled) {
+      return
+    }
 
     const now = Date.now()
-    if (now - this.lastDoubleClickTime < 300) return
+    if (now - this.lastDoubleClickTime < 300) {
+      return
+    }
+
     this.lastDoubleClickTime = now
 
     const rect = this.canvas.getBoundingClientRect()
@@ -1194,56 +1337,59 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   }
 
   private handleTouchStart(e: TouchEvent) {
+    const canHandleSingleTouch
+      = e.touches.length === 1 && (!this.config.panning.disabled || !this.config.doubleClick.disabled)
+    const canHandlePinch = e.touches.length === 2 && !this.config.pinch.disabled
+
+    if (!canHandleSingleTouch && !canHandlePinch) {
+      return
+    }
+
     e.preventDefault()
 
     if (this.isAnimating) {
       this.isAnimating = false
       this.animationStartLOD = -1
-      return
     }
 
-    if (e.touches.length === 1 && !this.config.panning.disabled) {
+    if (e.touches.length === 1) {
       const touch = e.touches[0]
       const now = Date.now()
 
       // 检测双击
       if (
-        !this.config.doubleClick.disabled &&
-        now - this.lastTouchTime < 300 &&
-        Math.abs(touch.clientX - this.lastTouchX) < 50 &&
-        Math.abs(touch.clientY - this.lastTouchY) < 50
+        !this.config.doubleClick.disabled
+        && now - this.lastTouchTime < 300
+        && Math.abs(touch.clientX - this.lastTouchX) < 50
+        && Math.abs(touch.clientY - this.lastTouchY) < 50
       ) {
         this.handleTouchDoubleTap(touch.clientX, touch.clientY)
         this.lastTouchTime = 0
         return
       }
 
-      this.isDragging = true
-      this.lastMouseX = touch.clientX
-      this.lastMouseY = touch.clientY
+      if (!this.config.panning.disabled) {
+        this.isDragging = true
+        this.lastMouseX = touch.clientX
+        this.lastMouseY = touch.clientY
+      }
 
       this.lastTouchTime = now
       this.lastTouchX = touch.clientX
       this.lastTouchY = touch.clientY
-    } else if (e.touches.length === 2 && !this.config.pinch.disabled) {
+    }
+    else if (e.touches.length === 2 && !this.config.pinch.disabled) {
       this.isDragging = false
       const touch1 = e.touches[0]
       const touch2 = e.touches[1]
-      this.lastTouchDistance = Math.sqrt(
-        Math.pow(touch2.clientX - touch1.clientX, 2) +
-          Math.pow(touch2.clientY - touch1.clientY, 2),
-      )
+      this.lastTouchDistance = Math.hypot(touch2.clientX - touch1.clientX, touch2.clientY - touch1.clientY)
     }
   }
 
   private handleTouchMove(e: TouchEvent) {
-    e.preventDefault()
+    if (e.touches.length === 1 && this.isDragging && !this.config.panning.disabled) {
+      e.preventDefault()
 
-    if (
-      e.touches.length === 1 &&
-      this.isDragging &&
-      !this.config.panning.disabled
-    ) {
       const deltaX = e.touches[0].clientX - this.lastMouseX
       const deltaY = e.touches[0].clientY - this.lastMouseY
 
@@ -1255,13 +1401,13 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
 
       this.constrainImagePosition()
       this.render()
-    } else if (e.touches.length === 2 && !this.config.pinch.disabled) {
+    }
+    else if (e.touches.length === 2 && !this.config.pinch.disabled) {
+      e.preventDefault()
+
       const touch1 = e.touches[0]
       const touch2 = e.touches[1]
-      const distance = Math.sqrt(
-        Math.pow(touch2.clientX - touch1.clientX, 2) +
-          Math.pow(touch2.clientY - touch1.clientY, 2),
-      )
+      const distance = Math.hypot(touch2.clientX - touch1.clientX, touch2.clientY - touch1.clientY)
 
       if (this.lastTouchDistance > 0) {
         const scaleFactor = distance / this.lastTouchDistance
@@ -1282,7 +1428,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
   }
 
   private handleTouchDoubleTap(clientX: number, clientY: number) {
-    if (this.config.doubleClick.disabled) return
+    if (this.config.doubleClick.disabled) {
+      return
+    }
 
     const rect = this.canvas.getBoundingClientRect()
     const touchX = clientX - rect.left
@@ -1303,41 +1451,27 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       const effectiveMaxScale = Math.max(userMaxScale, originalSizeScale)
 
       if (this.isOriginalSize) {
-        const targetScale = Math.max(
-          absoluteMinScale,
-          Math.min(effectiveMaxScale, fitToScreenScale),
-        )
+        const targetScale = Math.max(absoluteMinScale, Math.min(effectiveMaxScale, fitToScreenScale))
         const zoomX = (x - this.canvasWidth / 2 - this.translateX) / this.scale
         const zoomY = (y - this.canvasHeight / 2 - this.translateY) / this.scale
         const targetTranslateX = x - this.canvasWidth / 2 - zoomX * targetScale
         const targetTranslateY = y - this.canvasHeight / 2 - zoomY * targetScale
 
-        this.startAnimation(
-          targetScale,
-          targetTranslateX,
-          targetTranslateY,
-          this.config.doubleClick.animationTime,
-        )
+        this.startAnimation(targetScale, targetTranslateX, targetTranslateY, this.config.doubleClick.animationTime)
         this.isOriginalSize = false
-      } else {
-        const targetScale = Math.max(
-          absoluteMinScale,
-          Math.min(effectiveMaxScale, originalSizeScale),
-        )
+      }
+      else {
+        const targetScale = Math.max(absoluteMinScale, Math.min(effectiveMaxScale, originalSizeScale))
         const zoomX = (x - this.canvasWidth / 2 - this.translateX) / this.scale
         const zoomY = (y - this.canvasHeight / 2 - this.translateY) / this.scale
         const targetTranslateX = x - this.canvasWidth / 2 - zoomX * targetScale
         const targetTranslateY = y - this.canvasHeight / 2 - zoomY * targetScale
 
-        this.startAnimation(
-          targetScale,
-          targetTranslateX,
-          targetTranslateY,
-          this.config.doubleClick.animationTime,
-        )
+        this.startAnimation(targetScale, targetTranslateX, targetTranslateY, this.config.doubleClick.animationTime)
         this.isOriginalSize = true
       }
-    } else {
+    }
+    else {
       this.zoomAt(x, y, this.config.doubleClick.step, true)
     }
   }
@@ -1350,7 +1484,9 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
     const userMaxScale = fitToScreenScale * this.config.maxScale
     const effectiveMaxScale = Math.max(userMaxScale, originalSizeScale)
 
-    if (newScale < absoluteMinScale || newScale > effectiveMaxScale) return
+    if (newScale < absoluteMinScale || newScale > effectiveMaxScale) {
+      return
+    }
 
     if (animated && this.config.smooth) {
       const zoomX = (x - this.canvasWidth / 2 - this.translateX) / this.scale
@@ -1359,7 +1495,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       const targetTranslateY = y - this.canvasHeight / 2 - zoomY * newScale
 
       this.startAnimation(newScale, targetTranslateX, targetTranslateY)
-    } else {
+    }
+    else {
       const zoomX = (x - this.canvasWidth / 2 - this.translateX) / this.scale
       const zoomY = (y - this.canvasHeight / 2 - this.translateY) / this.scale
 
@@ -1389,7 +1526,8 @@ export class WebGLImageViewerEngine extends ImageViewerEngineBase {
       if (this.onImageCopied) {
         this.onImageCopied()
       }
-    } catch (error) {
+    }
+    catch (error) {
       console.error('Failed to copy image to clipboard:', error)
     }
   }

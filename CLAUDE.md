@@ -2,138 +2,172 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Authoritative Guides
+
+This repo already has detailed `AGENTS.md` files. Read the one closest to the code you are touching before making non-trivial changes:
+
+- `AGENTS.md` (root) — full commands list, monorepo architecture, manifest/data flow, i18n rules.
+- `DESIGN.md` (root) — **the normative design system for `apps/web` + `packages/ui`**: UIKit colour tokens, material/blur roles, radius, typography, spring motion, z-index tiers, layout, iconography, and an explicit list of files that violate the system (§13) and must not be copied. Derived from shipped code. The `afilmory-web-design` skill is its fast path.
+- `apps/web/AGENTS.md` — thin pointer to `DESIGN.md` plus the SPA's red lines and folder structure.
+- `be/AGENTS.md` — the NestJS-style Hono framework: modules, controllers, providers, decorators, DI via `tsyringe`, request-scoped context via `AsyncLocalStorage`. **Stale on package names**: it says `@afilmory/framework`, but the framework was extracted to npm as `@tsuki-hono/{core,common,openapi,event-emitter}`. The concepts still apply; the import paths don't.
+- `be/apps/core/AGENTS.md` — backend core service architecture.
+- `DEVELOPMENT.md` — self-host quick start and config field reference (`builder.config.ts`, `config.json`).
+- `.cursor/rules/*.mdc` — code quality, color (Apple UIKit Tailwind classes), i18n, project description.
+- `docs/superpowers/specs/*.md` — dated design specs (`YYYY-MM-DD-<topic>-design.md`) for most non-trivial features; `docs/superpowers/plans/` holds their execution plans. Check for an existing spec before redesigning something.
+
+When those files contradict anything below, prefer them (except where flagged stale above).
+
 ## Commands
 
-### Development Commands
 ```bash
-# Start development server (runs both web and SSR)
-pnpm dev
+# Dev
+pnpm dev                          # SSR wrapper (also serves SPA in dev, Next on :1924)
+pnpm --filter web dev             # SPA only
+pnpm --filter @afilmory/ssr dev   # SSR only
+pnpm dev:be                       # Backend (be/apps/core) via nodemon
+pnpm --filter @afilmory/dashboard dev  # Admin dashboard
+pnpm dev:mobile                   # Build + run the native iOS app (Local variant) in Simulator
+pnpm site:dev                     # Astro marketing site (127.0.0.1:4325)
+pnpm docs:dev                     # Docs site
 
-# Start only web development server
-pnpm --filter web dev
+# Build
+pnpm build                        # Production build (via @afilmory/ssr)
+pnpm build:demo                   # Demo data + web build
+pnpm build:manifest               # Run photo pipeline → photos-manifest.json + thumbnails (incremental)
+pnpm build:manifest -- --force            # Full rebuild of photos AND manifest
+pnpm build:manifest -- --force-manifest   # Regenerate manifest only
+pnpm build:manifest -- --force-thumbnails # Regenerate thumbnails only
+pnpm build:variant-report         # Builder cluster/variant analysis report
 
-# Start only SSR development server
-pnpm --filter @afilmory/ssr dev
+# DB (Drizzle; schema lives in be/packages/db, SSR has its own)
+pnpm --filter @afilmory/be db:generate / db:migrate / db:studio
+pnpm --filter @afilmory/ssr db:generate / db:migrate
 
-# Build production version
-pnpm build
+# Quality
+pnpm lint                         # eslint --fix (append paths to scope it: `pnpm lint apps/web/src/...`)
+pnpm format                       # prettier (apps, packages, be)
+pnpm type-check                   # recursive `pnpm -r type-check`
+pnpm --filter web type-check      # type-check just the SPA
 
-# Build manifest from storage (generates photo metadata)
-pnpm run build:manifest
-
-# Force rebuild all photos and metadata
-pnpm run build:manifest -- --force
-
-# Force regenerate thumbnails only
-pnpm run build:manifest -- --force-thumbnails
-
-# Force regenerate manifest only
-pnpm run build:manifest -- --force-manifest
+# Local infra
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# docker-compose.yml owns postgres/redis; docker-compose.dev.yml adds only rustfs (S3) on :9300/:9301.
+# Never redefine `db`/`redis` in the dev file — same project name silently recreates them on different volumes.
 ```
 
-### Database Commands (SSR app)
-```bash
-# Generate database migrations
-pnpm --filter @afilmory/ssr db:generate
+### Tests
 
-# Run database migrations
-pnpm --filter @afilmory/ssr db:migrate
+There is no repo-wide test runner; tests are per-package and use two different harnesses.
+
+```bash
+pnpm --filter @afilmory/be test                    # recursive across be/*
+pnpm --filter @afilmory/task-queue test            # vitest run --coverage
+pnpm --filter core exec vitest run <file>          # be/apps/core has vitest.config.ts but no `test` script
+pnpm --filter @afilmory/viewer-motion test         # node:test via `tsx --test src/*.test.ts`
+pnpm exec tsx --test apps/web/src/modules/viewer/entry-animation-state.test.ts  # web's node:test files
 ```
 
-### Code Quality Commands
-```bash
-# Lint and fix code
-pnpm lint
+Single vitest test: `pnpm --filter core exec vitest run src/guards/auth.guard.spec.ts -t "test name"`.
+For everything else, verify via `pnpm build`, `pnpm type-check`, `pnpm lint`, and (for image processing) `pnpm build:manifest`.
 
-# Format code
-pnpm format
+Package manager is **pnpm 11** (`packageManager` pin in root `package.json`). Workspace globs in `pnpm-workspace.yaml`: `apps/**/*`, `packages/*`, `packages/*/*`, `be`, `be/packages/*`, `be/apps/*`. Pinned versions live in the pnpm `catalog:` (`tailwindcss`, `typescript`, `zod`, `motion`, …) — prefer `catalog:` over a literal version when adding a shared dep.
 
-# Type check (web app)
-pnpm --filter web type-check
+## Architecture (Big Picture)
+
+Afilmory is a photo gallery composed of several deployable layers plus a builder pipeline. The same SPA runs in all serving modes; the difference is **who injects `window.__MANIFEST__`**.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     packages/builder (CLI pipeline)                  │
+│   sync (S3/GitHub/Eagle/local) → format/EXIF → thumbs/blurhash       │
+│              → photos-manifest.json (+ optional repo sync)           │
+└────────────────────────────────┬─────────────────────────────────────┘
+                                 │
+                writes apps/web/src/data/photos-manifest.json
+                                 │
+┌────────────────────────────────▼─────────────────────────────────────┐
+│  apps/web (Vite + React 19 SPA)                                      │
+│    PhotoLoader reads window.__MANIFEST__ (data, cameras, lenses)     │
+│    Standalone fallback: bundled manifest JSON                        │
+└────────────────────────────────▲─────────────────────────────────────┘
+                                 │ injects __MANIFEST__
+        ┌────────────────────────┼─────────────────────────┐
+        │                                                  │
+┌───────┴───────────────┐                       ┌──────────┴──────────┐
+│ apps/ssr (Next.js 15) │                       │ be/apps/core (Hono) │
+│ static manifest JSON  │                       │ DB-backed manifest  │
+│ + dynamic OG / SEO    │                       │ + dashboard / API   │
+└───────────────────────┘                       └──────────┬──────────┘
+                                                           │ REST + SSE
+                                                ┌──────────┴──────────┐
+                                                │ apps/mobile (Swift) │
+                                                │ native iOS client   │
+                                                └─────────────────────┘
 ```
 
-## Architecture
+Key implications when changing things:
 
-### Monorepo Structure
-This is a pnpm workspace with multiple applications and packages:
+- **`apps/web` is the only web UI codebase.** It must work in *both* the static/SSR flow and the full backend flow. Don't assume a backend is present — feature-detect on `window.__MANIFEST__` shape.
+- **The SPA has two build modes**, switched by env, not by config file: `BUILD_FOR_SERVER_SERVE=1` moves the Vite `base` to `/static/web/` and drops the static-web plugins; `AFILMORY_EMBED_MANIFEST=false` stops inlining the manifest so the server can inject it. `be/apps/core` sets both when it builds the SPA it serves (see `static-web.service.ts`).
+- **`packages/data`** owns `PhotoLoader` (the singleton that wraps the manifest into lookup maps). Anything photo-related goes through it. Shared types live in `packages/typing`.
+- **`packages/builder`** is the only place that talks to storage providers (S3/B2/GitHub/Eagle/local). It is configured by `builder.config.ts` (infrastructure) which is separate from `site.config.ts` + `config.json` (presentation/branding).
+- **`be/`** uses a NestJS-inspired Hono framework (`@tsuki-hono/core`): `@Module`, `@Controller`, `@Get/@Post/...`, `@injectable()`, request context via `AsyncLocalStorage`. Don't reach for raw Hono primitives in feature code — use the framework decorators (see `be/AGENTS.md`).
+- **`apps/ssr` is a thin host**, not a backend. Its job is to serve the SPA and provide OG/SEO/manifest injection. Heavy logic belongs in `be/apps/core` or `packages/builder`.
+- **Two separate design systems**: `apps/web` + `packages/ui` follow the dark, material-and-blur system specified in root `DESIGN.md`; `be/apps/dashboard` is a linear, data-first admin UI. Don't mix the two.
 
-- `apps/web/` - Main frontend React application (Vite + React 19)
-- `apps/ssr/` - Next.js SSR application for server-side rendering and APIs
-- `packages/` - Shared packages and utilities
-- `packages/builder/` - Photo processing and manifest generation tool
-- `packages/webgl-viewer/` - WebGL-based photo viewer component
+### Workspace Map
 
-### Key Technologies
-- **Frontend**: React 19, TypeScript, Vite, Tailwind CSS, Jotai (state), TanStack Query
-- **Backend**: Next.js 15, Drizzle ORM, PostgreSQL
-- **Image Processing**: Sharp, EXIF extraction, WebGL rendering
-- **Storage**: S3-compatible storage, GitHub storage support
-- **Build Tools**: pnpm workspaces, ESLint, Prettier
+| Path | What it is |
+| --- | --- |
+| `apps/web` | Vite + React 19 SPA — the gallery UI (the only web UI codebase) |
+| `apps/ssr` | Next.js 15 host: serves SPA assets, injects manifest, dynamic OG/SEO |
+| `apps/mobile` | Native Swift/UIKit iOS app (see below) |
+| `apps/site` | Astro marketing/landing site |
+| `apps/docs` | Vite-based documentation site |
+| `be/apps/core` | Hono backend: DB-backed manifest, REST API, serves SPA |
+| `be/apps/dashboard` | Admin SPA for the backend |
+| `be/apps/oauth-gateway` | Standalone OAuth broker (own Dockerfile) |
+| `be/packages/{db,redis,task-queue,utils,env}` | Drizzle schema/migrations, Redis client, job queue, shared backend utils, env validation |
+| `packages/builder` | Photo pipeline CLI (the only storage-provider consumer) |
+| `packages/data` | `PhotoLoader` singleton + bundled manifest |
+| `packages/typing` | Shared photo/manifest types |
+| `packages/webgl-viewer` | WebGL photo viewer engine |
+| `packages/viewer-motion` | Framework-agnostic viewer motion primitives (has real unit tests) |
+| `packages/renderer` | `@afilmory/og-renderer` — OG image rendering |
+| `packages/sdk` | `@afilmory/sdk` — public SDK + share embed script |
+| `packages/{ui,hooks,utils}` | Shared UI elements, React hooks, utilities |
 
-### Configuration Files
-- `builder.config.json` - Photo processing and storage configuration
-- `config.json` - Site configuration (name, description, author, etc.)
-- `site.config.ts` - TypeScript site configuration with defaults
-- `env.ts` - Environment variables validation and types
+## Mobile App (`apps/mobile`)
 
-### Photo Processing Pipeline
-1. **Storage Sync**: Fetches photos from configured storage (S3/GitHub)
-2. **Format Conversion**: Converts HEIC, TIFF to web-compatible formats
-3. **Thumbnail Generation**: Creates multiple sizes for performance
-4. **EXIF Extraction**: Extracts camera settings and GPS data
-5. **Manifest Generation**: Creates `photos-manifest.json` with metadata
+**Read `apps/mobile/CLAUDE.md` before touching mobile code** — it covers the architecture in depth. The essentials:
 
-### Development Workflow
-- Web app runs on development server with hot reload
-- SSR app provides APIs and server-side rendering
-- Builder tool processes photos and generates metadata
-- Database migrations handle schema changes
+- **iOS only, forever.** Never spend effort on Android compatibility, fallbacks, or testing.
+- **It is a pure native Swift/UIKit app.** Expo / React Native was deleted in `66fae030`; there is no Metro, no JS runtime, no CocoaPods, and no npm dependencies. `package.json` only wraps XcodeGen and xcodebuild.
+- **`project.yml` (XcodeGen) is the source of truth**; `Afilmory.xcodeproj` is generated output that is nonetheless committed. Source roots are filesystem-synchronized folders (Xcode 16 buildable folders), so adding/deleting `.swift` files needs no regeneration — run `pnpm --filter @afilmory/mobile native:generate` only when `project.yml` changes. Never edit the project through the Xcode UI.
+- **iOS 18 deployment target**, Swift 6. Post-18 APIs need an availability guard and an iOS 18 fallback — Liquid Glass goes through `Afilmory/DesignSystem/AdaptiveGlass.swift`.
+- **Two variants from one source tree**: `Afilmory Local` (`app.afilmory.local`, `localhost:1841`, no entitlements) and `Afilmory` (production). Capability differences are gated centrally in `AfilmoryBuildConfiguration`.
+- **Run/build/test**: `pnpm --filter @afilmory/mobile ios:local` / `ios:production` / `native:test`. TestFlight goes through `.github/workflows/mobile-testflight.yml`; see `apps/mobile/RELEASE.md`.
+- **Simulator automation**: use `axe` (`brew install cameroncooke/axe/axe`) for tap/swipe HID injection + `xcrun simctl io <udid> screenshot`; never control the user's mouse (cliclick/AppleScript). Run the memory guard during Simulator verification — see `apps/mobile/AGENTS.md`.
+- **UIGlassEffect gotcha**: `isInteractive = true` swallows touches meant for buttons hosted in the effect view's `contentView` — keep it off for tappable glass controls; floating control clusters need `UIGlassContainerEffect` hosting per-element `UIGlassEffect` views to get real refraction and merge behavior.
 
-### Code Quality Rules
-1. Avoid code duplication - extract common types and components
-2. Keep components focused - use hooks and component composition
-3. Follow React best practices - proper Context usage, state management
-4. Use TypeScript strictly - leverage type safety throughout
+## Project Conventions That Matter
 
-### i18n Guidelines
-- Use flat keys with `.` separation (e.g., `exif.camera.model`)
-- Support pluralization with `_one` and `_other` suffixes
-- Modify English first, then other languages (ESLint auto-removes unused keys)
-- **CRITICAL: Avoid nested key conflicts in flat structure**
-  - ❌ WRONG: `"action.tag.mode.and": "AND"` + `"action.tag.mode.and.tooltip": "..."`
-  - ✅ CORRECT: `"action.tag.mode.and": "AND"` + `"action.tag.tooltip.and": "..."`
-  - Rule: A key cannot be both a string value AND a parent object
-  - Each key must be completely independent in the flat structure
+- **No feature flags or backwards-compat shims.** App is unreleased — change code in place. (Stated explicitly at the bottom of root `AGENTS.md`.)
+- **Pages are thin routing shells.** Real UI/logic lives under `modules/<domain>/**` in `apps/web`.
+- **State isolation over prop drilling.** For deep subtrees, lift handlers into colocated Jotai/Zustand stores or contexts; don't thread props through layers.
+- **Push state down**, not up. Feature-local stores/providers; switching tabs should unmount unused logic.
+- **Tailwind colors must use the Apple UIKit palette** (`text-text-secondary`, `bg-fill`, `bg-material-thick`, `border-accent/20`, …). Full rules in root `DESIGN.md` §2; `.cursor/rules/color.mdc` has the token list. No raw hex or `gray-*`/`zinc-*` ramps for chrome; `color-mix()` in an inline style is only for multi-stop gradients and layered shadows.
+- **i18n: flat keys with `.` separators**, no nested objects. Two namespaces under `locales/`: `app/` (SPA) with `en, zh-CN, zh-HK, zh-TW, jp, ko`, and `dashboard/` (en + zh-CN only). Edit `en.json` of the relevant namespace first; ESLint auto-strips keys missing from English in other locales. **Never let a key be both a leaf string and a parent path** (`a.b` cannot coexist with `a.b.c`); the build flattens dots into nested objects and will collide. Use `_one`/`_other` for plurals.
+- **The iOS app does not use `locales/`.** It localizes natively through String Catalogs — `apps/mobile/Afilmory/Resources/Localizable.xcstrings` (keys are the English source text, auto-extracted from `String(localized:)` / `Text(_:)` at build time), `ExifValues.xcstrings` (dotted keys for EXIF values looked up dynamically), and `apps/mobile/targets/share/Localizable.xcstrings` for the share extension.
+- **No bare global `location`** — an ESLint `no-restricted-globals` rule forbids it (the router instance differs between Electron and browser). Use `useLocation()` or `getReadonlyRoute()`.
+- **Decorators are enabled** (`emitDecoratorMetadata`, `experimentalDecorators`) for the backend framework.
+- **`motion` / `motion-dom` are pinned** via pnpm `overrides` (currently `12.38.0`) — don't bump them casually. Same for the security-driven `overrides` on `hono`, `vite`, `esbuild`, `qs`, etc.
 
-### Testing Strategy
-- Check README.md and package.json scripts for test commands
-- Verify builds work with `pnpm build`
-- Test photo processing with `pnpm run build:manifest`
-- Validate types with `pnpm --filter web type-check`
+## Configuration Layering
 
-## Cursor Rules Integration
+Two configs, two purposes — don't conflate them:
 
-### Code Quality Standards
-- Avoid code duplication - extract common types and components when used multiple times
-- Keep components focused - use hooks and component splitting for large logic blocks
-- Master React philosophy - proper Context usage, component composition, state management to prevent re-renders
+- `builder.config.ts` (+ `builder.config.default.ts` template) → **infrastructure**: storage provider, concurrency, worker/cluster mode, repo sync plugin. Consumed only by `packages/builder`.
+- `site.config.ts` + `config.json` → **presentation**: name, description, author, social, accent color, map provider/style/projection, feed, beian. Consumed by SPA, SSR, and backend for consistent branding.
 
-### UI/UX Guidelines
-- Use Apple UIKit color system via tailwind-uikit-colors package
-- Prefer semantic color names: `text-primary`, `fill-secondary`, `material-thin`, etc.
-- Follow system colors: `red`, `blue`, `green`, `mint`, `teal`, `cyan`, `indigo`, `purple`, `pink`, `brown`, `gray`
-- Use material design principles with opacity-based fills and proper contrast
-
-### i18n Development Rules
-- Use flat keys with dot notation: `exif.camera.model`
-- Support pluralization: `_one` and `_other` suffixes
-- Always modify English (`en.json`) first, then other languages
-- Avoid key conflicts in flat structure (e.g., `exif.custom.rendered` vs `exif.custom.rendered.custom`)
-- ESLint automatically removes unused keys from non-English files
-
-## Important Notes
-- This is a photo gallery application that processes and displays photos from cloud storage
-- The builder tool handles complex image processing workflows
-- WebGL viewer provides high-performance photo viewing experience
-- Map integration shows photo locations from GPS EXIF data
-- Live Photo support for iOS/Apple device videos
+Environment variables flow through `env.ts` (root — S3 + `PG_CONNECTION_STRING` + `GIT_TOKEN`) and `@afilmory/env` (backend) — both validate via Zod / `@t3-oss/env-core`.

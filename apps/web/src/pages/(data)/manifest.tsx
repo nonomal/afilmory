@@ -1,8 +1,6 @@
 import { photoLoader } from '@afilmory/data'
+import { Button, ScrollArea } from '@afilmory/ui'
 import { useMemo, useState } from 'react'
-
-import { Button } from '~/components/ui/button'
-import { ScrollArea } from '~/components/ui/scroll-areas/ScrollArea'
 
 // JSON 语法高亮组件
 const JsonHighlight = ({ data }: { data: any }) => {
@@ -43,17 +41,9 @@ const JsonHighlight = ({ data }: { data: any }) => {
 }
 
 // 统计卡片组件
-const StatCard = ({
-  label,
-  value,
-  icon,
-}: {
-  label: string
-  value: string | number
-  icon: string
-}) => (
+const StatCard = ({ label, value, icon }: { label: string; value: string | number; icon: string }) => (
   <div className="group relative overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/50 p-6 backdrop-blur-sm transition-all hover:border-zinc-700 hover:bg-zinc-900/80">
-    <div className="absolute inset-0 bg-gradient-to-br from-zinc-800/0 via-zinc-800/5 to-zinc-800/10" />
+    <div className="absolute inset-0 bg-linear-to-br from-zinc-800/0 via-zinc-800/5 to-zinc-800/10" />
     <div className="relative">
       <div className="flex items-center justify-between">
         <div className="text-3xl">{icon}</div>
@@ -107,7 +97,7 @@ const ManifestStats = ({ data }: { data: any[] }) => {
 // 照片卡片组件
 const PhotoCard = ({ photo, index }: { photo: any; index: number }) => (
   <div className="group relative overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/30 backdrop-blur-sm transition-all hover:border-zinc-700 hover:bg-zinc-900/50">
-    <div className="absolute inset-0 bg-gradient-to-br from-zinc-800/0 via-zinc-800/5 to-zinc-800/10 opacity-0 transition-opacity group-hover:opacity-100" />
+    <div className="absolute inset-0 bg-linear-to-br from-zinc-800/0 via-zinc-800/5 to-zinc-800/10 opacity-0 transition-opacity group-hover:opacity-100" />
 
     <div className="relative p-6">
       <div className="flex items-start gap-4">
@@ -120,7 +110,7 @@ const PhotoCard = ({ photo, index }: { photo: any; index: number }) => (
                 alt={photo.title}
                 className="h-16 w-16 object-cover transition-transform group-hover:scale-110"
               />
-              <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent" />
+              <div className="absolute inset-0 bg-linear-to-t from-black/20 to-transparent" />
             </div>
           ) : (
             <div className="flex h-16 w-16 items-center justify-center rounded-lg bg-zinc-800 text-zinc-600">
@@ -135,9 +125,7 @@ const PhotoCard = ({ photo, index }: { photo: any; index: number }) => (
             <span className="inline-flex h-6 w-8 items-center justify-center rounded bg-zinc-800 font-mono text-xs text-zinc-400">
               {index + 1}
             </span>
-            <h3 className="truncate font-medium text-zinc-100">
-              {photo.title}
-            </h3>
+            <h3 className="truncate font-medium text-zinc-100">{photo.title}</h3>
           </div>
 
           {/* 元数据网格 */}
@@ -150,9 +138,7 @@ const PhotoCard = ({ photo, index }: { photo: any; index: number }) => (
             </div>
             <div className="flex items-center gap-2">
               <span className="text-zinc-500">📦</span>
-              <span className="text-zinc-300">
-                {(photo.size / (1024 * 1024)).toFixed(1)} MB
-              </span>
+              <span className="text-zinc-300">{(photo.size / (1024 * 1024)).toFixed(1)} MB</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-zinc-500">📷</span>
@@ -228,7 +214,7 @@ export const Component = () => {
   return (
     <div className="min-h-screen bg-black">
       {/* 背景渐变 */}
-      <div className="fixed inset-0 bg-gradient-to-br from-zinc-900 via-black to-zinc-900" />
+      <div className="fixed inset-0 bg-linear-to-br from-zinc-900 via-black to-zinc-900" />
       <div className="fixed inset-0 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-blue-900/20 via-transparent to-transparent" />
 
       {/* Header */}
@@ -238,9 +224,7 @@ export const Component = () => {
             <div className="flex h-16 items-center justify-between">
               <div className="flex items-center gap-6">
                 <div className="flex items-center gap-3">
-                  <h1 className="text-xl font-semibold text-zinc-100">
-                    Afilmory Manifest
-                  </h1>
+                  <h1 className="text-xl font-semibold text-zinc-100">Afilmory Manifest</h1>
                 </div>
 
                 <div className="flex items-center rounded-lg bg-zinc-900/50 p-1">
@@ -272,16 +256,14 @@ export const Component = () => {
                     onChange={(e) => setSearchTerm(e.target.value)}
                     className="w-64 rounded-lg border border-zinc-800 bg-zinc-900/50 px-4 py-2 text-sm text-zinc-100 placeholder-zinc-500 backdrop-blur-sm transition-colors focus:border-blue-500 focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   />
-                  <div className="absolute top-1/2 right-3 -translate-y-1/2 text-zinc-500">
-                    🔍
-                  </div>
+                  <div className="absolute top-1/2 right-3 -translate-y-1/2 text-zinc-500">🔍</div>
                 </div>
 
                 <Button
                   variant="primary"
                   size="sm"
                   onClick={handleExport}
-                  className="h-9 bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400"
+                  className="h-9 bg-linear-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400"
                 >
                   Export JSON
                 </Button>
@@ -296,9 +278,7 @@ export const Component = () => {
             <div className="space-y-8">
               {/* 统计信息 */}
               <div>
-                <h2 className="mb-6 text-lg font-medium text-zinc-300">
-                  Overview
-                </h2>
+                <h2 className="mb-6 text-lg font-medium text-zinc-300">Overview</h2>
                 <ManifestStats data={filteredPhotos} />
               </div>
 
@@ -309,9 +289,7 @@ export const Component = () => {
                     Photos ({filteredPhotos.length.toLocaleString()})
                   </h2>
                   {searchTerm && (
-                    <div className="text-sm text-zinc-400">
-                      Filtered from {photos.length.toLocaleString()} total
-                    </div>
+                    <div className="text-sm text-zinc-400">Filtered from {photos.length.toLocaleString()} total</div>
                   )}
                 </div>
 
@@ -328,12 +306,8 @@ export const Component = () => {
             /* 原始 JSON 数据视图 */
             <div>
               <div className="mb-6">
-                <h2 className="text-lg font-medium text-zinc-300">
-                  Raw Manifest Data
-                </h2>
-                <p className="mt-1 text-sm text-zinc-500">
-                  Complete JSON manifest in structured format
-                </p>
+                <h2 className="text-lg font-medium text-zinc-300">Raw Manifest Data</h2>
+                <p className="mt-1 text-sm text-zinc-500">Complete JSON manifest in structured format</p>
               </div>
 
               <div className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/30 backdrop-blur-sm">
@@ -344,21 +318,13 @@ export const Component = () => {
                       <div className="h-3 w-3 rounded-full bg-yellow-500" />
                       <div className="h-3 w-3 rounded-full bg-green-500" />
                     </div>
-                    <span className="font-mono text-sm text-zinc-400">
-                      photos-manifest.json
-                    </span>
+                    <span className="font-mono text-sm text-zinc-400">photos-manifest.json</span>
                   </div>
                 </div>
 
                 <ScrollArea rootClassName="h-[700px]">
                   <div className="p-6">
-                    <JsonHighlight
-                      data={
-                        searchTerm
-                          ? { version: 'v6', data: filteredPhotos }
-                          : manifestData
-                      }
-                    />
+                    <JsonHighlight data={searchTerm ? { version: 'v6', data: filteredPhotos } : manifestData} />
                   </div>
                 </ScrollArea>
               </div>
